@@ -23,17 +23,24 @@ var commands = []result{
 }
 
 func (a *app) filterCommands(q string) {
+	if a.rows == nil && a.filterBuffer != nil {
+		a.rows = a.filterBuffer[:0]
+		a.filterBuffer = nil
+	}
+	words := strings.Fields(strings.ToLower(q))
 	// Names rank ahead of descriptions so "daily" runs Daily Note rather
 	// than opening another command that merely mentions it.
 	for _, titleMatch := range []bool{true, false} {
 		for _, command := range commands {
+			title := strings.ToLower(command.Title)
+			searchable := title + " " + strings.ToLower(command.Detail)
 			match := true
 			inTitle := true
-			for _, word := range strings.Fields(strings.ToLower(q)) {
-				if !strings.Contains(strings.ToLower(command.Title), word) {
+			for _, word := range words {
+				if !strings.Contains(title, word) {
 					inTitle = false
 				}
-				if !strings.Contains(strings.ToLower(command.Title+" "+command.Detail), word) {
+				if !strings.Contains(searchable, word) {
 					match = false
 					break
 				}

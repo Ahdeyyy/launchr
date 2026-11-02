@@ -14,9 +14,17 @@ import (
 
 var user32 = syscall.NewLazyDLL("user32.dll")
 var kernel32 = syscall.NewLazyDLL("kernel32.dll")
+var windowProcs sync.Map
+var cloakedProc = syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmGetWindowAttribute")
+var openProcessProc = kernel32.NewProc("OpenProcess")
+var processPathProc = kernel32.NewProc("QueryFullProcessImageNameW")
 
 func winCall(name string, args ...uintptr) uintptr {
-	r, _, _ := user32.NewProc(name).Call(args...)
+	p, ok := windowProcs.Load(name)
+	if !ok {
+		p, _ = windowProcs.LoadOrStore(name, user32.NewProc(name))
+	}
+	r, _, _ := p.(*syscall.LazyProc).Call(args...)
 	return r
 }
 func hideCommand(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true} }
@@ -26,47 +34,66 @@ type appWindow struct {
 	Title, Path string
 }
 
+var enumerationState = struct {
+	sync.Mutex
+	next  uintptr
+	lists map[uintptr]*[]appWindow
+}{lists: make(map[uintptr]*[]appWindow)}
+
+var enumWindowsCallback = syscall.NewCallback(func(hwnd, lparam uintptr) uintptr {
+	enumerationState.Lock()
+	result := enumerationState.lists[lparam]
+	enumerationState.Unlock()
+	if result == nil {
+		return 0
+	}
+	if winCall("IsWindowVisible", hwnd) == 0 || winCall("GetWindow", hwnd, 4) != 0 {
+		return 1
+	}
+	if winCall("GetWindowLongW", hwnd, uintptr(0xffff_ffec))&0x80 != 0 {
+		return 1
+	}
+	var pid uint32
+	winCall("GetWindowThreadProcessId", hwnd, uintptr(unsafe.Pointer(&pid)))
+	if pid == uint32(os.Getpid()) {
+		return 1
+	}
+	n := winCall("GetWindowTextLengthW", hwnd)
+	if n == 0 {
+		return 1
+	}
+	buf := make([]uint16, n+1)
+	winCall("GetWindowTextW", hwnd, uintptr(unsafe.Pointer(&buf[0])), n+1)
+	// Cloaked windows belong to other virtual desktops or suspended apps.
+	var cloaked uint32
+	cloakedProc.Call(hwnd, 14, uintptr(unsafe.Pointer(&cloaked)), 4)
+	if cloaked != 0 {
+		return 1
+	}
+	path := ""
+	p, _, _ := openProcessProc.Call(0x1000, 0, uintptr(pid))
+	if p != 0 {
+		var size uint32 = 32768
+		exe := make([]uint16, size)
+		r, _, _ := processPathProc.Call(p, 0, uintptr(unsafe.Pointer(&exe[0])), uintptr(unsafe.Pointer(&size)))
+		if r != 0 {
+			path = syscall.UTF16ToString(exe[:size])
+		}
+		syscall.CloseHandle(syscall.Handle(p))
+	}
+	*result = append(*result, appWindow{hwnd, syscall.UTF16ToString(buf), path})
+	return 1
+})
+
 func openWindows() []appWindow {
 	var result []appWindow
-	cb := syscall.NewCallback(func(hwnd, lparam uintptr) uintptr {
-		if winCall("IsWindowVisible", hwnd) == 0 || winCall("GetWindow", hwnd, 4) != 0 {
-			return 1
-		}
-		if winCall("GetWindowLongW", hwnd, uintptr(0xffff_ffec))&0x80 != 0 {
-			return 1
-		}
-		var pid uint32
-		winCall("GetWindowThreadProcessId", hwnd, uintptr(unsafe.Pointer(&pid)))
-		if pid == uint32(os.Getpid()) {
-			return 1
-		}
-		n := winCall("GetWindowTextLengthW", hwnd)
-		if n == 0 {
-			return 1
-		}
-		buf := make([]uint16, n+1)
-		winCall("GetWindowTextW", hwnd, uintptr(unsafe.Pointer(&buf[0])), n+1)
-		// Cloaked windows belong to other virtual desktops or suspended apps.
-		var cloaked uint32
-		syscall.NewLazyDLL("dwmapi.dll").NewProc("DwmGetWindowAttribute").Call(hwnd, 14, uintptr(unsafe.Pointer(&cloaked)), 4)
-		if cloaked != 0 {
-			return 1
-		}
-		path := ""
-		p, _, _ := kernel32.NewProc("OpenProcess").Call(0x1000, 0, uintptr(pid))
-		if p != 0 {
-			var size uint32 = 32768
-			exe := make([]uint16, size)
-			r, _, _ := kernel32.NewProc("QueryFullProcessImageNameW").Call(p, 0, uintptr(unsafe.Pointer(&exe[0])), uintptr(unsafe.Pointer(&size)))
-			if r != 0 {
-				path = syscall.UTF16ToString(exe[:size])
-			}
-			syscall.CloseHandle(syscall.Handle(p))
-		}
-		result = append(result, appWindow{hwnd, syscall.UTF16ToString(buf), path})
-		return 1
-	})
-	winCall("EnumWindows", cb, 0)
+	enumerationState.Lock()
+	enumerationState.next++
+	id := enumerationState.next
+	enumerationState.lists[id] = &result
+	enumerationState.Unlock()
+	defer func() { enumerationState.Lock(); delete(enumerationState.lists, id); enumerationState.Unlock() }()
+	winCall("EnumWindows", enumWindowsCallback, id)
 	return result
 }
 func activateWindow(w appWindow) error {

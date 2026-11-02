@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"embed"
-	"image/png"
 
-	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -42,25 +39,11 @@ func (a *app) resultIcon(c *ui.Context, r result, kind string) {
 			a.iconPending = map[string]bool{}
 		}
 		a.iconPending[path] = true
-		// Request visible icons only. Shell dispatches extraction to its owning
-		// thread; decoding happens here, outside the view's build pass.
-		a.background(func() {
-			data, err := mygo.Shell.FileIcon(path, 48)
-			if err != nil {
-				return
-			}
-			img, err := png.Decode(bytes.NewReader(data))
-			if err != nil {
-				return
-			}
-			bitmap := ui.NewBitmap(img)
-			a.update(func() {
-				if a.icons == nil {
-					a.icons = map[string]*ui.Bitmap{}
-				}
-				a.icons[path] = bitmap
-			})
-		})
+		select {
+		case a.iconJobs <- path:
+		default:
+			delete(a.iconPending, path)
+		}
 	}
 	if kind == "command" {
 		kind = "settings"

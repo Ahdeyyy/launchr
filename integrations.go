@@ -20,6 +20,58 @@ type rate struct {
 	Fetched time.Time `json:"fetched"`
 }
 
+// Stale rates are usable immediately. Refreshes belong to the app lifetime,
+// not a particular amount edit, and are rate-limited per currency pair.
+func (a *app) currencyResult(ctx context.Context, q conversion, client *http.Client, endpoint string) (string, string, error) {
+	var cached rate
+	key := q.From + "/" + q.To
+	if q.From == q.To || a.db.load("rates", key, &cached) != nil || cached.Rate <= 0 || time.Since(cached.Fetched) <= 6*time.Hour {
+		return convertCurrency(ctx, a.db, client, endpoint, q)
+	}
+	value := q.Amount * cached.Rate
+	if math.IsInf(value, 0) {
+		return "", "", fmt.Errorf("amount is too large")
+	}
+	return fmt.Sprintf("%.2f %s", value, q.To), "Cached rate from " + cached.Date + " (refreshing when available)", nil
+}
+
+func (a *app) refreshCurrency(q conversion, client *http.Client, endpoint string) {
+	key := q.From + "/" + q.To
+	a.rateMu.Lock()
+	if a.rateRetry == nil {
+		a.rateRetry = make(map[string]time.Time)
+	}
+	start := time.Now().After(a.rateRetry[key]) && a.ctx != nil && a.ctx.Err() == nil
+	if start {
+		a.rateRetry[key] = time.Now().Add(time.Minute)
+	}
+	a.rateMu.Unlock()
+	if start {
+		a.background(func() {
+			job, cancel := context.WithTimeout(a.ctx, 8*time.Second)
+			defer cancel()
+			_, detail, err := convertCurrency(job, a.db, client, endpoint, q)
+			a.update(func() {
+				current, ok := parseConversion(a.query)
+				if !ok || current.From != q.From || current.To != q.To || (a.tab != "Apps" && a.tab != "Calculator") || a.ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					a.status = err.Error()
+					return
+				}
+				if strings.HasPrefix(detail, "Offline") {
+					for i := range a.rows {
+						a.rows[i].Detail = detail
+					}
+					return
+				}
+				a.search(false)
+			})
+		})
+	}
+}
+
 func convertCurrency(ctx context.Context, s *store, client *http.Client, endpoint string, q conversion) (string, string, error) {
 	if q.From == q.To {
 		return fmt.Sprintf("%.2f %s", q.Amount, q.To), "Same currency", nil

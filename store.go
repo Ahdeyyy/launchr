@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -28,7 +30,12 @@ type settings struct {
 	Density    string
 	WindowSize string
 }
-type store struct{ db *bolt.DB }
+type store struct {
+	db            *bolt.DB
+	indexMu       sync.Mutex
+	contentMu     sync.Mutex
+	indexComplete atomic.Bool
+}
 
 func openStore(dir string) (*store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -39,7 +46,7 @@ func openStore(dir string) (*store, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range []string{"clips", "data", "hashes", "settings", "rates"} {
+		for _, name := range []string{"clips", "data", "hashes", "settings", "rates", "thumbnails", "index-grams", "index-counts", "index-records", "index-overflow", "index-state"} {
 			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
 				return err
 			}
@@ -50,15 +57,51 @@ func openStore(dir string) (*store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &store{db}, nil
+	s := &store{db: db}
+	_ = db.View(func(tx *bolt.Tx) error {
+		s.indexComplete.Store(tx.Bucket([]byte("index-state")).Get([]byte("complete")) != nil)
+		return nil
+	})
+	return s, nil
 }
-func idKey(id uint64) []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, id); return b }
+func idKey(id uint64) []byte  { b := make([]byte, 8); binary.BigEndian.PutUint64(b, id); return b }
+func keyID(key []byte) uint64 { return binary.BigEndian.Uint64(key) }
 func (s *store) add(kind string, data []byte) error {
+	s.contentMu.Lock()
+	defer s.contentMu.Unlock()
 	if len(data) == 0 {
 		return nil
 	}
-	sum := sha256.Sum256(append([]byte(kind+":"), data...))
-	hash := hex.EncodeToString(sum[:])
+	hasher := sha256.New()
+	hasher.Write([]byte(kind + ":"))
+	hasher.Write(data)
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	var previous clip
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if old := tx.Bucket([]byte("hashes")).Get([]byte(hash)); old != nil {
+			return json.Unmarshal(tx.Bucket([]byte("clips")).Get(old), &previous)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	preview := previous.Preview
+	var grams, thumb []byte
+	if previous.Hash == "" {
+		preview = "Image"
+		if kind == "text" {
+			var truncated bool
+			preview, truncated = textSummary(data, 160, true)
+			if truncated {
+				preview += "…"
+			}
+			grams = searchGrams(data)
+		} else {
+			grams = searchGrams([]byte(preview))
+			thumb, _ = makeThumbnail(data)
+		}
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		entries, hashes := tx.Bucket([]byte("clips")), tx.Bucket([]byte("hashes"))
 		if old := hashes.Get([]byte(hash)); old != nil {
@@ -70,14 +113,6 @@ func (s *store) add(kind string, data []byte) error {
 		if err != nil {
 			return err
 		}
-		preview := "Image"
-		if kind == "text" {
-			preview = strings.Join(strings.Fields(string(data)), " ")
-			r := []rune(preview)
-			if len(r) > 160 {
-				preview = string(r[:160]) + "…"
-			}
-		}
 		meta, err := json.Marshal(clip{id, hash, kind, preview, len(data), time.Now()})
 		if err != nil {
 			return err
@@ -88,11 +123,27 @@ func (s *store) add(kind string, data []byte) error {
 		if err = hashes.Put([]byte(hash), idKey(id)); err != nil {
 			return err
 		}
-		return tx.Bucket([]byte("data")).Put([]byte(hash), data)
+		if tx.Bucket([]byte("data")).Get([]byte(hash)) == nil {
+			if err = tx.Bucket([]byte("data")).Put([]byte(hash), data); err != nil {
+				return err
+			}
+			if len(thumb) > 0 {
+				if err = tx.Bucket([]byte("thumbnails")).Put([]byte(hash), thumb); err != nil {
+					return err
+				}
+			}
+		}
+		if previous.Hash == "" {
+			return putSearchIndex(tx, hash, grams)
+		}
+		return nil
 	})
 }
 func (s *store) page(ctx context.Context, query string, before uint64, limit int) (out []clip, more bool, err error) {
 	q := []byte(strings.ToLower(strings.TrimSpace(query)))
+	if len(q) > 0 {
+		return s.searchPage(ctx, query, before, limit)
+	}
 	err = s.db.View(func(tx *bolt.Tx) error {
 		cur := tx.Bucket([]byte("clips")).Cursor()
 		k, v := cur.Last()
@@ -111,15 +162,6 @@ func (s *store) page(ctx context.Context, query string, before uint64, limit int
 			var item clip
 			if err := json.Unmarshal(v, &item); err != nil {
 				return err
-			}
-			if len(q) > 0 {
-				hay := []byte(strings.ToLower(item.Preview))
-				if item.Kind == "text" {
-					hay = bytes.ToLower(tx.Bucket([]byte("data")).Get([]byte(item.Hash)))
-				}
-				if !bytes.Contains(hay, q) {
-					continue
-				}
 			}
 			if len(out) == limit {
 				more = true
@@ -143,14 +185,19 @@ func (s *store) data(item clip) (data []byte, err error) {
 	return
 }
 func (s *store) delete(item clip) error {
+	s.contentMu.Lock()
+	defer s.contentMu.Unlock()
 	return s.db.Update(func(tx *bolt.Tx) error {
 		if tx.Bucket([]byte("clips")).Get(idKey(item.ID)) == nil || !bytes.Equal(tx.Bucket([]byte("hashes")).Get([]byte(item.Hash)), idKey(item.ID)) {
 			return fmt.Errorf("this clipboard item changed; refresh the history before deleting it")
 		}
+		if err := deleteSearchIndex(tx, item.Hash); err != nil {
+			return err
+		}
 		for _, p := range []struct {
 			bucket string
 			key    []byte
-		}{{"clips", idKey(item.ID)}, {"data", []byte(item.Hash)}, {"hashes", []byte(item.Hash)}} {
+		}{{"clips", idKey(item.ID)}, {"data", []byte(item.Hash)}, {"hashes", []byte(item.Hash)}, {"thumbnails", []byte(item.Hash)}} {
 			if err := tx.Bucket([]byte(p.bucket)).Delete(p.key); err != nil {
 				return err
 			}

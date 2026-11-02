@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"image"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -28,8 +27,9 @@ type result struct {
 	Window                         appWindow
 }
 type capture struct {
-	kind string
-	data []byte
+	kind  string
+	data  []byte
+	epoch uint64
 }
 type app struct {
 	w                                                       *mygo.Window
@@ -38,7 +38,20 @@ type app struct {
 	cancel                                                  context.CancelFunc
 	wg                                                      sync.WaitGroup
 	stopClipboard                                           func()
-	captures                                                chan capture
+	captureSignals                                          chan struct{}
+	capturePaused                                           atomic.Bool
+	captureEpoch                                            atomic.Uint64
+	iconJobs                                                chan string
+	previewJobs                                             chan previewJob
+	previewCancel                                           context.CancelFunc
+	refreshPending                                          bool
+	historyDirty                                            bool
+	appNames                                                []string
+	unpinned                                                []result
+	filterBuffer                                            []result
+	previewGeneration                                       uint64
+	rateMu                                                  sync.Mutex
+	rateRetry                                               map[string]time.Time
 	prefs                                                   settings
 	query, tab, status, shortcut                            string
 	rows                                                    []result
@@ -47,6 +60,7 @@ type app struct {
 	input                                                   ui.Handle
 	apps                                                    []mygo.InstalledApp
 	windows                                                 []appWindow
+	windowsPending                                          bool
 	searchCancel                                            context.CancelFunc
 	generation                                              uint64
 	busy, more, paused, settingsOpen, composing, actionBusy bool
@@ -80,20 +94,33 @@ func (a *app) setTab(tab string) {
 	a.input.Focus()
 }
 func (a *app) search(appendPage bool) {
+	a.searchWithOptions(appendPage, false, false)
+}
+func (a *app) searchWithOptions(appendPage, typing, preserve bool) {
 	if a.searchCancel != nil {
 		a.searchCancel()
 	}
 	a.generation++
 	gen := a.generation
-	if !appendPage {
+	selectedID := ""
+	selectedHash := ""
+	if preserve {
+		if r, ok := a.selected(); ok {
+			selectedID = r.ID
+			selectedHash = r.Clip.Hash
+		}
+	}
+	if !appendPage && !preserve {
 		// A new query chooses its first result rather than following the old
 		// selected item's key into a different result set.
 		a.list = ui.ListState{}
+		a.filterBuffer = a.rows[:0]
 		a.rows = nil
 		a.chosen = 0
 		a.preview = nil
 		a.previewText = ""
 		a.previewID = 0
+		a.cancelPreview()
 	}
 	a.status = ""
 	a.more = false
@@ -135,12 +162,8 @@ func (a *app) search(appendPage bool) {
 	vault := a.prefs.Vault
 	a.busy = true
 	a.background(func() {
-		timer := time.NewTimer(120 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
+		if typing && ((tab == "Clipboard" && q != "") || tab == "Obsidian") && !waitJob(ctx, 120*time.Millisecond) {
 			return
-		case <-timer.C:
 		}
 		var rows []result
 		var err error
@@ -171,7 +194,7 @@ func (a *app) search(appendPage bool) {
 			if conv, ok := parseConversion(q); ok {
 				var value, detail string
 				job, done := context.WithTimeout(ctx, 8*time.Second)
-				value, detail, err = convertCurrency(job, a.db, &http.Client{Timeout: 8 * time.Second}, "https://api.frankfurter.dev/v2/rate", conv)
+				value, detail, err = a.currencyResult(job, conv, &http.Client{Timeout: 8 * time.Second}, "https://api.frankfurter.dev/v2/rate")
 				done()
 				if err == nil {
 					rows = []result{{ID: "answer", Title: value, Detail: detail, Kind: "answer", Value: strings.Fields(value)[0]}}
@@ -192,6 +215,12 @@ func (a *app) search(appendPage bool) {
 				return
 			}
 			a.busy = false
+			if a.historyDirty {
+				a.historyDirty = false
+				if a.tab == "Clipboard" && a.w.IsVisible() {
+					a.refreshHistory()
+				}
+			}
 			a.more = more
 			if err != nil {
 				a.status = err.Error()
@@ -202,7 +231,20 @@ func (a *app) search(appendPage bool) {
 			} else {
 				a.rows = rows
 			}
+			if len(rows) > 0 && strings.HasPrefix(rows[0].Detail, "Cached rate from ") {
+				if conv, ok := parseConversion(q); ok {
+					a.refreshCurrency(conv, &http.Client{Timeout: 8 * time.Second}, "https://api.frankfurter.dev/v2/rate")
+				}
+			}
 			a.chosen = min(a.chosen, max(0, len(a.rows)-1))
+			if selectedID != "" {
+				for i := range a.rows {
+					if a.rows[i].ID == selectedID || (selectedHash != "" && a.rows[i].Clip.Hash == selectedHash) {
+						a.chosen = i
+						break
+					}
+				}
+			}
 		})
 	})
 }
@@ -216,31 +258,50 @@ func looksLikeMath(q string) bool {
 	return strings.ContainsAny(q[:1], "0123456789.(+-") || strings.HasPrefix(q, "sqrt(") || strings.HasPrefix(q, "abs(") || strings.HasPrefix(q, "sin(") || strings.HasPrefix(q, "cos(") || strings.HasPrefix(q, "log(") || q == "pi"
 }
 func (a *app) filterApps(q string) {
+	if a.rows == nil && a.filterBuffer != nil {
+		a.rows = a.filterBuffer[:0]
+		a.filterBuffer = nil
+	}
+	words := strings.Fields(strings.ToLower(q))
 	match := func(s string) bool {
-		for _, word := range strings.Fields(strings.ToLower(q)) {
-			if !strings.Contains(strings.ToLower(s), word) {
+		for _, word := range words {
+			if !strings.Contains(s, word) {
 				return false
 			}
 		}
 		return true
 	}
 	for _, w := range a.windows {
-		if match(w.Title) {
+		if match(strings.ToLower(w.Title)) {
 			a.rows = append(a.rows, result{ID: fmt.Sprint(w.Handle), Title: w.Title, Detail: "Open window", Kind: "window", Window: w})
 		}
 	}
-	for _, pinned := range []bool{true, false} {
-		for _, item := range a.apps {
-			pin := slices.Contains(a.prefs.Pins, item.ID)
-			if pin != pinned || !match(item.Name) {
-				continue
-			}
-			detail := "Application"
-			if pin {
-				detail = "Pinned"
-			}
-			a.rows = append(a.rows, result{ID: item.ID, Title: item.Name, Detail: detail, Kind: "app", App: item})
+	if len(a.appNames) != len(a.apps) {
+		a.cacheAppNames()
+	}
+	pins := make(map[string]bool, len(a.prefs.Pins))
+	for _, id := range a.prefs.Pins {
+		pins[id] = true
+	}
+	a.unpinned = a.unpinned[:0]
+	for i, item := range a.apps {
+		if !match(a.appNames[i]) {
+			continue
 		}
+		r := result{ID: item.ID, Title: item.Name, Detail: "Application", Kind: "app", App: item}
+		if pins[item.ID] {
+			r.Detail = "Pinned"
+			a.rows = append(a.rows, r)
+		} else {
+			a.unpinned = append(a.unpinned, r)
+		}
+	}
+	a.rows = append(a.rows, a.unpinned...)
+}
+func (a *app) cacheAppNames() {
+	a.appNames = make([]string, len(a.apps))
+	for i, item := range a.apps {
+		a.appNames[i] = strings.ToLower(item.Name)
 	}
 }
 func formatSize(n int) string {
@@ -266,6 +327,7 @@ func (a *app) choose(delta int) {
 	a.list.ScrollIntoView(a.chosen)
 }
 func (a *app) hide() {
+	a.cancelPreview()
 	if a.w != nil {
 		a.w.Hide()
 	}
@@ -397,56 +459,6 @@ func (a *app) deleteClip() {
 		})
 	})
 }
-func (a *app) loadPreview() {
-	r, ok := a.selected()
-	if !ok || r.Kind != "clip" || r.Clip.ID == a.previewID {
-		return
-	}
-	a.previewID = r.Clip.ID
-	a.preview = nil
-	a.previewText = ""
-	id := r.Clip.ID
-	a.background(func() {
-		data, err := a.db.data(r.Clip)
-		var bitmap *ui.Bitmap
-		text := ""
-		if err == nil {
-			if r.Clip.Kind == "image" {
-				img, _, e := image.Decode(bytes.NewReader(data))
-				err = e
-				if err == nil {
-					bounds := img.Bounds()
-					w, h := bounds.Dx(), bounds.Dy()
-					scale := min(1.0, 480.0/float64(max(w, h)))
-					dst := image.NewRGBA(image.Rect(0, 0, max(1, int(float64(w)*scale)), max(1, int(float64(h)*scale))))
-					for y := 0; y < dst.Bounds().Dy(); y++ {
-						for x := 0; x < dst.Bounds().Dx(); x++ {
-							dst.Set(x, y, img.At(bounds.Min.X+int(float64(x)/scale), bounds.Min.Y+int(float64(y)/scale)))
-						}
-					}
-					bitmap = ui.NewBitmap(dst)
-				}
-			} else {
-				runes := []rune(string(data))
-				if len(runes) > 4000 {
-					runes = append(runes[:4000], []rune("\n… Preview truncated. Copy restores the full text.")...)
-				}
-				text = string(runes)
-			}
-		}
-		a.update(func() {
-			if a.previewID != id {
-				return
-			}
-			if err != nil {
-				a.status = err.Error()
-				return
-			}
-			a.preview = bitmap
-			a.previewText = text
-		})
-	})
-}
 
 var searchIcon = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>`))
 
@@ -558,7 +570,7 @@ func (a *app) view(c *ui.Context) {
 			case "Obsidian":
 				placeholder = "Search notes…"
 			}
-			ui.TextInputBase(c.Key("search:"+a.tab), &a.query).Bind(&a.input).AutoFocus().Grow(1).FontSize(density.searchFont).Placeholder(placeholder).Label("Search").OnChange(func() { a.search(false) }).OnSubmit(a.activate)
+			ui.TextInputBase(c.Key("search:"+a.tab), &a.query).Bind(&a.input).AutoFocus().Grow(1).FontSize(density.searchFont).Placeholder(placeholder).Label("Search").OnChange(func() { a.searchWithOptions(false, true, false) }).OnSubmit(a.activate)
 		})
 		ui.Row(c).Padding(density.tabsY, 12).Gap(4).Children(func() {
 			for i, tab := range []string{"Apps", "Clipboard", "Calculator", "Obsidian"} {
@@ -586,7 +598,7 @@ func (a *app) view(c *ui.Context) {
 							if a.paused {
 								label = "Resume capture"
 							}
-							plainButton(c, label).TextColor(theme.TextMuted).OnClick(func() { a.paused = !a.paused })
+							plainButton(c, label).TextColor(theme.TextMuted).OnClick(func() { a.paused = !a.paused; a.capturePaused.Store(a.paused); a.captureEpoch.Add(1) })
 							ui.Text(c, "No automatic expiry").FontSize(12).TextColor(theme.TextMuted).Grow(1).TextAlign(ui.End)
 							plainButton(c, "Delete selected").TextColor(theme.TextMuted).OnClick(a.deleteClip)
 						})
@@ -733,7 +745,19 @@ func cliContent(s string) string {
 }
 
 func (a *app) show() {
-	a.windows = openWindows()
+	if !a.windowsPending {
+		a.windowsPending = true
+		a.background(func() {
+			windows := openWindows()
+			a.update(func() {
+				a.windowsPending = false
+				a.windows = windows
+				if a.tab == "Apps" && !a.settingsOpen && !a.composing && a.w.IsVisible() {
+					a.search(false)
+				}
+			})
+		})
+	}
 	a.search(false)
 	d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
 	a.applyWindowSize(d.WorkArea)
@@ -746,24 +770,10 @@ func (a *app) show() {
 	a.w.Focus()
 }
 func (a *app) captureClipboard() {
-	a.update(func() {
-		if a.paused {
-			return
-		}
-		data := mygo.Clipboard.ReadImage()
-		kind := "image"
-		if len(data) == 0 {
-			data = []byte(mygo.Clipboard.ReadText())
-			kind = "text"
-		}
-		if len(data) == 0 {
-			return
-		}
-		select {
-		case a.captures <- capture{kind, data}:
-		case <-a.ctx.Done():
-		}
-	})
+	select {
+	case a.captureSignals <- struct{}{}:
+	default:
+	}
 }
 func trayIcon() []byte {
 	return sizedTrayIcon(trayPixelSize())
@@ -796,22 +806,12 @@ func (a *app) ready() {
 		tray.SetMenu(mygo.NewMenu([]*mygo.MenuItem{{Label: "Open Launchr", Click: func(*mygo.MenuItem, *mygo.Window) { a.show() }}, {Role: mygo.RoleQuit}}))
 		tray.OnClick(a.show)
 	}
-	a.captures = make(chan capture, 32)
+	a.startCaptureWorkers()
+	a.startIconWorker()
+	a.startPreviewWorker()
 	a.background(func() {
-		for {
-			select {
-			case <-a.ctx.Done():
-				return
-			case item := <-a.captures:
-				err := a.db.add(item.kind, item.data)
-				a.update(func() {
-					if err != nil {
-						a.status = "Clipboard: " + err.Error()
-					} else if a.tab == "Clipboard" && a.w.IsVisible() {
-						a.search(false)
-					}
-				})
-			}
+		if err := a.db.ensureIndex(a.ctx); err != nil && a.ctx.Err() == nil {
+			a.clipboardError(err)
 		}
 	})
 	a.stopClipboard, err = watchClipboard(a.captureClipboard)
@@ -826,6 +826,7 @@ func (a *app) ready() {
 				return
 			}
 			a.apps = apps
+			a.cacheAppNames()
 			if a.tab == "Apps" {
 				a.search(false)
 			}
