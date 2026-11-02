@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/color"
-	"image/png"
 	"log"
 	"net/http"
 	"os"
@@ -56,6 +54,12 @@ type app struct {
 	previewID                                               uint64
 	preview                                                 *ui.Bitmap
 	previewText                                             string
+	history                                                 []navigation
+	formInput                                               ui.Handle
+	icons                                                   map[string]*ui.Bitmap
+	iconPending                                             map[string]bool
+	densityEdit                                             string
+	windowSizeEdit                                          string
 }
 
 func (a *app) background(fn func()) { a.wg.Add(1); go func() { defer a.wg.Done(); fn() }() }
@@ -65,6 +69,8 @@ func (a *app) update(fn func()) {
 	}
 }
 func (a *app) setTab(tab string) {
+	a.history = nil
+	a.settingsOpen = false
 	a.tab = tab
 	a.query = ""
 	a.composing = false
@@ -80,6 +86,9 @@ func (a *app) search(appendPage bool) {
 	a.generation++
 	gen := a.generation
 	if !appendPage {
+		// A new query chooses its first result rather than following the old
+		// selected item's key into a different result set.
+		a.list = ui.ListState{}
 		a.rows = nil
 		a.chosen = 0
 		a.preview = nil
@@ -90,12 +99,18 @@ func (a *app) search(appendPage bool) {
 	a.more = false
 	q, tab := strings.TrimSpace(a.query), a.tab
 	if tab == "Apps" && !looksLikeMath(q) {
+		if q != "" {
+			a.filterCommands(q)
+		}
 		a.filterApps(q)
+		if q == "" {
+			a.filterCommands(q)
+		}
 		a.busy = false
 		return
 	}
 	if tab == "Obsidian" && q == "" {
-		a.rows = []result{{ID: "daily", Title: "Open daily note", Detail: "Obsidian", Kind: "daily"}}
+		a.rows = []result{{ID: "daily", Title: "Open daily note", Detail: "Obsidian · Run action", Kind: "daily"}, {ID: "capture", Title: "Quick capture", Detail: "Obsidian · Write a note", Kind: "command", Value: "capture"}}
 		a.busy = false
 		return
 	}
@@ -261,6 +276,8 @@ func (a *app) activate() {
 		return
 	}
 	switch r.Kind {
+	case "command":
+		a.openCommand(r.Value)
 	case "window":
 		a.hide()
 		if err := activateWindow(r.Window); err != nil {
@@ -320,7 +337,7 @@ func (a *app) obsidianAction(command string, params []string, clear bool) {
 			if clear {
 				a.noteBody = ""
 				a.noteTitle = ""
-				a.composing = false
+				a.back()
 				a.status = "Saved to Obsidian"
 			} else {
 				a.hide()
@@ -351,7 +368,14 @@ func (a *app) savePrefs(next settings) {
 				a.status = err.Error()
 				return
 			}
+			resize := normalizedWindowSize(a.prefs.WindowSize) != normalizedWindowSize(next.WindowSize)
 			a.prefs = next
+			if resize {
+				x, y := a.w.Position()
+				w, h := a.w.Size()
+				d := mygo.Screen.DisplayNearestPoint(mygo.Point{X: x + w/2, Y: y + h/2})
+				a.applyWindowSize(d.WorkArea)
+			}
 			a.status = "Settings saved"
 			a.search(false)
 		})
@@ -428,13 +452,16 @@ var searchIcon = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg"
 
 var rowIcons = func() map[string]*ui.SVG {
 	paths := map[string]string{
-		"app":    `<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>`,
-		"window": `<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18m-13-5v5"/>`,
-		"clip":   `<rect x="5" y="5" width="14" height="16" rx="2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 12h6m-6 4h6"/>`,
-		"image":  `<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m3 18 5-5 4 4 4-6 5 7"/>`,
-		"note":   `<path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8m-8 4h6"/>`,
-		"daily":  `<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 11h18m-14 4h3m4 0h3"/>`,
-		"answer": `<path d="M5 9h14M5 15h14"/>`,
+		"app":        `<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>`,
+		"window":     `<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18m-13-5v5"/>`,
+		"clip":       `<rect x="5" y="5" width="14" height="16" rx="2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 12h6m-6 4h6"/>`,
+		"image":      `<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m3 18 5-5 4 4 4-6 5 7"/>`,
+		"note":       `<path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8m-8 4h6"/>`,
+		"daily":      `<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 11h18m-14 4h3m4 0h3"/>`,
+		"answer":     `<path d="M5 9h14M5 15h14"/>`,
+		"calculator": `<rect x="5" y="2" width="14" height="20" rx="3"/><path d="M8 6h8M8 11h1m6 0h1m-8 4h1m6 0h1m-8 4h1m6 0h1"/>`,
+		"currency":   `<path d="M3 7h17l-4-4M21 17H4l4 4M12 8v8m3-7h-4a2 2 0 0 0 0 4h2a2 2 0 0 1 0 4H9"/>`,
+		"settings":   `<path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="18" r="2"/>`,
 	}
 	icons := map[string]*ui.SVG{}
 	for kind, path := range paths {
@@ -448,52 +475,81 @@ func plainButton(c *ui.Context, label string) ui.Element {
 }
 
 func (a *app) view(c *ui.Context) {
+	density := a.density()
 	theme := ui.DarkTheme()
-	theme.Background = ui.RGB(24, 25, 27)
-	theme.Surface = ui.RGB(32, 34, 37)
-	theme.SurfaceHover = ui.RGB(43, 46, 49)
-	theme.Border = ui.RGB(56, 59, 62)
-	theme.Accent = ui.RGB(173, 203, 180)
-	theme.AccentText = ui.RGB(22, 31, 25)
-	theme.Focus = ui.Transparent
+	theme.Background = ui.Hex("#090909")
+	theme.Font = "Martian Grotesk"
+	theme.Surface = ui.Hex("#141414")
+	theme.SurfaceHover = ui.Hex("#242424")
+	theme.SurfacePressed = ui.Hex("#303030")
+	theme.Border = ui.Hex("#303030")
+	theme.Accent = ui.Hex("#eeeeec")
+	theme.AccentHover = ui.Hex("#ffffff")
+	theme.AccentPressed = ui.Hex("#cececc")
+	theme.AccentText = ui.Hex("#111111")
+	theme.Text = ui.Hex("#f2f2f0")
+	theme.TextMuted = ui.Hex("#a7a7a5")
+	theme.Selection = ui.Hex("#606060")
+	theme.Scrollbar = ui.Hex("#858583").Alpha(.45)
+	theme.ScrollbarWidth = 5
+	theme.Focus = theme.Accent.Alpha(.6)
 	theme.FontSize = 14
-	theme.Radius = 6
+	theme.Spacing = density.spacing
+	theme.Radius = 10
+	if c.Vibrancy() {
+		// Acrylic supplies the blur. Only the surfaces are translucent;
+		// text and controls retain their contrast and opacity.
+		theme.Background = theme.Background.Alpha(.42)
+		theme.Surface = theme.Surface.Alpha(.40)
+		theme.SurfaceHover = theme.SurfaceHover.Alpha(.65)
+		// Keep selection opaque so desktop colors cannot wash it out.
+	}
 	c.SetTheme(theme)
 	c.OnShortcut(ui.Cmd, ui.KeyQ, mygo.App.Quit)
-	c.OnShortcut(0, ui.KeyEscape, func() {
-		if a.settingsOpen || a.composing {
-			a.settingsOpen = false
-			a.composing = false
-		} else if a.query != "" {
-			a.query = ""
-			a.search(false)
-		} else {
-			a.hide()
+	c.Root().Background(theme.Background)
+	c.OnShortcut(0, ui.KeyEscape, a.back)
+	c.OnShortcut(ui.Cmd, ui.KeyComma, a.openSettings)
+	c.OnShortcut(ui.Cmd, ui.KeyB, a.back)
+	c.OnShortcut(ui.Cmd, ui.KeyF, func() {
+		if !a.settingsOpen && !a.composing {
+			a.input.Focus(c)
 		}
 	})
+
 	for i, key := range []ui.Key{ui.Key1, ui.Key2, ui.Key3, ui.Key4} {
 		tab := []string{"Apps", "Clipboard", "Calculator", "Obsidian"}[i]
 		c.OnShortcut(ui.Cmd, key, func() { a.setTab(tab) })
 	}
 	if !a.settingsOpen && !a.composing {
-		c.OnShortcut(0, ui.KeyDown, func() { a.choose(1) })
-		c.OnShortcut(0, ui.KeyUp, func() { a.choose(-1) })
-		c.OnShortcut(0, ui.KeyEnter, a.activate)
+		a.searchShortcuts(c)
+		c.OnShortcut(ui.Cmd, ui.KeyN, func() { a.choose(1) })
+		c.OnShortcut(ui.Cmd, ui.KeyDelete, a.deleteClip)
+		c.OnShortcut(ui.Cmd, ui.KeyL, func() {
+			if a.more {
+				a.search(true)
+			}
+		})
 		c.OnShortcut(ui.Cmd, ui.KeyP, a.pin)
 	}
 	ui.Column(c).Fill().Children(func() {
-		ui.Row(c).Padding(12, 18).AlignItems(ui.Center).Gap(8).Children(func() {
+		ui.Row(c).Padding(density.headerY, density.inset).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Icon(c, appMark).Size(28, 28).Shrink(0).TextColor(theme.Text)
 			ui.Text(c, "Launchr").Bold().Grow(1).DragWindow()
-			plainButton(c, "Settings").TextColor(theme.TextMuted).Padding(4, 8).OnClick(func() { a.settingsOpen = !a.settingsOpen; a.vaultEdit = a.prefs.Vault })
+			plainButton(c, "Settings").TextColor(theme.TextMuted).Padding(4, 8).OnClick(func() { a.openSettings() })
 			plainButton(c, "Hide").TextColor(theme.TextMuted).Padding(4, 8).OnClick(a.hide)
 		})
 		if a.settingsOpen {
 			a.settingsView(c)
 			return
 		}
-		ui.Row(c).Padding(6, 18, 16, 18).Gap(12).AlignItems(ui.Center).Children(func() {
+		if a.composing {
+			ui.Row(c).Padding(0, 18).Children(func() { plainButton(c, "Back").TextColor(theme.Accent).OnClick(a.back) })
+			a.composeView(c)
+			return
+		}
+		ui.Row(c).Padding(density.searchY, density.inset).Background(theme.Surface).Gap(density.gap).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, searchIcon).FontSize(22).TextColor(theme.TextMuted)
-			placeholder := "Search apps, calculate, or convert…"
+			placeholder := "Search apps and commands…"
 			switch a.tab {
 			case "Clipboard":
 				placeholder = "Search clipboard history…"
@@ -502,22 +558,26 @@ func (a *app) view(c *ui.Context) {
 			case "Obsidian":
 				placeholder = "Search notes…"
 			}
-			ui.TextInputBase(c, &a.query).Bind(&a.input).AutoFocus().Grow(1).FontSize(20).Placeholder(placeholder).Label("Search").OnChange(func() { a.search(false) })
+			ui.TextInputBase(c.Key("search:"+a.tab), &a.query).Bind(&a.input).AutoFocus().Grow(1).FontSize(density.searchFont).Placeholder(placeholder).Label("Search").OnChange(func() { a.search(false) }).OnSubmit(a.activate)
 		})
-		ui.Row(c).Padding(0, 12, 10, 12).Gap(4).Children(func() {
-			for _, tab := range []string{"Apps", "Clipboard", "Calculator", "Obsidian"} {
+		ui.Row(c).Padding(density.tabsY, 12).Gap(4).Children(func() {
+			for i, tab := range []string{"Apps", "Clipboard", "Calculator", "Obsidian"} {
 				bg := ui.Transparent
 				ink := theme.TextMuted
 				if a.tab == tab {
-					bg = theme.SurfaceHover
+					bg = theme.Selection
 					ink = theme.Text
 				}
-				plainButton(c, tab).Padding(7, 12).Radius(6).Background(bg).TextColor(ink).OnClick(func() { a.setTab(tab) })
+				plainButton(c, fmt.Sprintf("%s  %d", tab, i+1)).Padding(7, 12).Radius(6).Background(bg).TextColor(ink).OnClick(func() { a.setTab(tab) })
 			}
 		})
-		if a.composing {
-			a.composeView(c)
-		} else {
+		if a.tab != "Apps" {
+			ui.Row(c).Padding(0, 18, 8, 18).Gap(8).Children(func() {
+				plainButton(c, "Back").TextColor(theme.Accent).OnClick(a.back)
+				ui.Text(c, "Launchr / "+a.tab).FontSize(12).TextColor(theme.TextMuted)
+			})
+		}
+		{
 			ui.Row(c).Grow(1).FillWidth().AlignItems(ui.Stretch).Children(func() {
 				ui.Column(c).Grow(1).Children(func() {
 					if a.tab == "Clipboard" {
@@ -533,7 +593,7 @@ func (a *app) view(c *ui.Context) {
 					}
 					if a.tab == "Obsidian" {
 						ui.Row(c).Padding(4, 18, 8, 18).Gap(16).Children(func() {
-							plainButton(c, "Quick capture").TextColor(theme.Accent).OnClick(func() { a.composing = true })
+							plainButton(c, "Quick capture").TextColor(theme.Accent).OnClick(func() { a.openCommand("capture") })
 							plainButton(c, "Daily note").TextColor(theme.TextMuted).OnClick(func() { a.obsidianAction("daily", nil, false) })
 						})
 					}
@@ -564,26 +624,41 @@ func (a *app) view(c *ui.Context) {
 					} else {
 						a.list.Selected = &a.chosen
 						a.list.Label = func(i int) string { return a.rows[i].Title }
-						ui.List(c, &a.list, len(a.rows)).Grow(1).FillWidth().Padding(6, 10).ItemKey(func(i int) any { return a.rows[i].Kind + ":" + a.rows[i].ID }).Rows(func(row ui.ListRow) {
+						// MyGo uses Accent for the native selected row. Scope its
+						// muted fill to the list so primary controls stay vivid.
+						listTheme := *theme
+						listTheme.Accent, listTheme.AccentText = theme.Selection, theme.Text
+						c.SetTheme(&listTheme)
+						ui.List(c, &a.list, len(a.rows)).Grow(1).FillWidth().Padding(6, 24, 6, 10).ItemKey(func(i int) any { return a.rows[i].Kind + ":" + a.rows[i].ID }).Rows(func(row ui.ListRow) {
 							r := a.rows[row.Index]
-							bg := ui.Transparent
-							if row.Index == a.chosen {
-								bg = theme.SurfaceHover
-							}
-							ui.Row(c).Padding(12).Gap(12).AlignItems(ui.Center).Radius(6).Background(bg).Children(func() {
+							// The list owns the selection and hover background. A second
+							// rounded fill here exposes the outer row at its corners.
+							ui.Row(c).Padding(density.rowY, density.rowX).Gap(density.gap).AlignItems(ui.Center).Children(func() {
 								kind := r.Kind
 								if kind == "clip" && r.Clip.Kind == "image" {
 									kind = "image"
 								}
-								ui.Icon(c, rowIcons[kind]).Size(22, 22).TextColor(theme.Accent)
-								ui.Column(c).Grow(1).Gap(4).Children(func() {
+								a.resultIcon(c, r, kind)
+								ui.Column(c).Grow(1).Gap(density.textGap).Children(func() {
 									size := float32(14)
 									if r.Kind == "answer" {
 										size = 24
 									}
-									ui.Text(c, r.Title).TextColor(theme.Text).FontSize(size).SingleLine()
-									ui.Text(c, r.Detail).FontSize(12).TextColor(theme.TextMuted).SingleLine()
+									ui.Text(c, r.Title).Bold().TextColor(theme.Text).FontSize(size).SingleLine()
+									muted := theme.TextMuted
+									if row.Selected() {
+										muted = ui.Hex("#dededc")
+									}
+									ui.Text(c, r.Detail).FontSize(12).TextColor(muted).SingleLine()
 								})
+								if r.Kind == "window" {
+									ui.Text(c, "Running").FontSize(11).TextColor(ui.Hex("#8de0bd")).Padding(4, 8).Radius(6).Background(ui.Hex("#254f43").Alpha(.65)).Shrink(0)
+								} else if r.Kind == "app" {
+									ui.Text(c, "Application").FontSize(11).TextColor(theme.TextMuted).Shrink(0)
+								}
+								if row.Index == a.chosen {
+									ui.Text(c, resultAction(r)+"  ↵").FontSize(11).TextColor(theme.Accent).Padding(4, 8).Background(theme.Surface).Radius(5).Shrink(0)
+								}
 								if r.Kind == "app" && row.Index == a.chosen {
 									label := "Pin"
 									if slices.Contains(a.prefs.Pins, r.App.ID) {
@@ -593,6 +668,7 @@ func (a *app) view(c *ui.Context) {
 								}
 							})
 						}).OnSubmit(a.activate)
+						c.SetTheme(theme)
 					}
 					if a.more {
 						plainButton(c, "Load older items").Padding(10).OnClick(func() { a.search(true) })
@@ -605,13 +681,13 @@ func (a *app) view(c *ui.Context) {
 						if a.preview != nil {
 							ui.Image(c, a.preview).Width(208).Height(240).Fit(ui.Contain)
 						} else if a.previewText != "" {
-							ui.Scroll(c).Grow(1).Children(func() { ui.Text(c, a.previewText).Wrap() })
+							ui.Scroll(c).Grow(1).Padding(0, 20, 0, 0).Children(func() { ui.Text(c, a.previewText).Wrap() })
 						}
 					})
 				}
 			})
 		}
-		ui.Row(c).Padding(12, 18).Gap(12).Children(func() {
+		ui.Row(c).Padding(density.headerY, density.inset).Background(theme.Surface).Gap(density.gap).Children(func() {
 			label := a.shortcut
 			if a.status != "" {
 				label = a.status
@@ -622,7 +698,10 @@ func (a *app) view(c *ui.Context) {
 			}
 			ui.Text(c, label).FontSize(12).TextColor(theme.TextMuted).Grow(1).MaxLines(2)
 			if !a.composing {
-				hint := "↑ ↓ Select    Enter Open"
+				hint := "↑ ↓ Select    Enter Open    Esc Back"
+				if r, ok := a.selected(); ok {
+					hint = "↑ ↓ Select    Enter " + resultAction(r) + "    Esc Back"
+				}
 				if a.tab == "Clipboard" {
 					hint = "Enter Copy"
 				} else if a.tab == "Calculator" {
@@ -633,32 +712,19 @@ func (a *app) view(c *ui.Context) {
 		})
 	})
 }
-func (a *app) settingsView(c *ui.Context) {
-	ui.Column(c).Grow(1).FillWidth().Padding(24).Gap(18).Children(func() {
-		ui.Text(c, "Settings").FontSize(20)
-		ui.Text(c, "Obsidian vault")
-		ui.TextInput(c, &a.vaultEdit).Label("Obsidian vault").Placeholder("Leave empty to use the active vault").FillWidth()
-		ui.Button(c, "Save").OnClick(func() {
-			next := a.prefs
-			next.Vault = strings.TrimSpace(a.vaultEdit)
-			a.savePrefs(next)
-			a.settingsOpen = false
-		})
-		ui.Text(c, "Enable the official CLI in Obsidian → Settings → General.").TextColor(c.Theme().TextMuted).Wrap()
-		ui.Text(c, "Ctrl+1–4 switches views. Ctrl+P pins an application.").TextColor(c.Theme().TextMuted).Wrap()
-		ui.Text(c, "Clipboard history stays on this device, unencrypted, until you delete it. Deleted space is reused by new entries.").TextColor(c.Theme().TextMuted).Wrap()
-	})
-}
 func (a *app) composeView(c *ui.Context) {
-	ui.Column(c).Grow(1).FillWidth().Padding(18).Gap(12).Children(func() {
-		ui.TextInput(c, &a.noteTitle).Label("Note title").Placeholder("Note title").FillWidth()
-		ui.TextArea(c, &a.noteBody).Label("Note content").Placeholder("Write a note…").Grow(1).FillWidth()
-		ui.Row(c).Gap(10).Children(func() {
-			ui.Button(c, "Create note").Disabled(a.actionBusy || strings.TrimSpace(a.noteTitle) == "" || strings.TrimSpace(a.noteBody) == "").OnClick(func() {
-				a.obsidianAction("create", []string{"name=" + a.noteTitle, "content=" + cliContent(a.noteBody)}, true)
-			})
-			ui.Button(c, "Append to daily note").Disabled(a.actionBusy || strings.TrimSpace(a.noteBody) == "").OnClick(func() { a.obsidianAction("daily:append", []string{"content=" + cliContent(a.noteBody)}, true) })
-			plainButton(c, "Cancel").OnClick(func() { a.composing = false })
+	density := a.density()
+	ui.Column(c).Grow(1).FillWidth().Padding(density.inset).Gap(density.gap).Children(func() {
+		c.OnShortcut(ui.Cmd, ui.KeyEnter, a.createNote)
+		c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyEnter, a.appendDaily)
+		ui.Text(c, "Quick capture").FontSize(22).Bold()
+		ui.Text(c, "Ctrl+Enter creates a note · Ctrl+Shift+Enter appends to today").FontSize(12).TextColor(c.Theme().TextMuted)
+		ui.TextInput(c.Key("note-title"), &a.noteTitle).Bind(&a.formInput).Label("Note title").Placeholder("Note title").FillWidth()
+		ui.TextArea(c, &a.noteBody).Label("Note content").Placeholder("Write a note…").Padding(density.scale(12), density.scale(24), density.scale(12), density.scale(12)).Grow(1).FillWidth()
+		ui.Row(c).Gap(density.scale(10)).Children(func() {
+			ui.Button(c, "Create note").Disabled(a.actionBusy || strings.TrimSpace(a.noteTitle) == "" || strings.TrimSpace(a.noteBody) == "").OnClick(a.createNote)
+			ui.Button(c, "Append to daily note").Disabled(a.actionBusy || strings.TrimSpace(a.noteBody) == "").OnClick(a.appendDaily)
+			plainButton(c, "Cancel").OnClick(a.back)
 		})
 	})
 }
@@ -670,9 +736,12 @@ func (a *app) show() {
 	a.windows = openWindows()
 	a.search(false)
 	d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
-	w, h := a.w.Size()
-	a.w.SetPosition(d.WorkArea.X+(d.WorkArea.Width-w)/2, d.WorkArea.Y+(d.WorkArea.Height-h)/3)
-	a.input.Focus()
+	a.applyWindowSize(d.WorkArea)
+	if a.composing || a.settingsOpen {
+		a.formInput.Focus()
+	} else {
+		a.input.Focus()
+	}
 	a.w.Show()
 	a.w.Focus()
 }
@@ -697,20 +766,12 @@ func (a *app) captureClipboard() {
 	})
 }
 func trayIcon() []byte {
-	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
-	for y := 6; y < 26; y++ {
-		for x := 7; x < 25; x++ {
-			if x < 12 || y > 20 {
-				img.Set(x, y, color.RGBA{173, 203, 180, 255})
-			}
-		}
-	}
-	var b bytes.Buffer
-	_ = png.Encode(&b, img)
-	return b.Bytes()
+	return sizedTrayIcon(trayPixelSize())
 }
 func (a *app) ready() {
-	a.w = mygo.NewWindow(mygo.WindowOptions{Title: "Launchr", Width: 760, Height: 520, MinWidth: 640, MinHeight: 420, Panel: true, Hidden: true, TitleBarStyle: mygo.TitleBarHidden, HideWindowButtons: true, BackgroundColor: "#18191b", Content: ui.View(a.view)})
+	mygo.Theme.SetSource(mygo.ThemeDark)
+	w, h := launcherWindowSize(a.prefs.WindowSize)
+	a.w = mygo.NewWindow(mygo.WindowOptions{Title: "Launchr", Width: w, Height: h, MinWidth: 640, MinHeight: 420, Panel: true, Hidden: true, TitleBarStyle: mygo.TitleBarHidden, HideWindowButtons: true, Transparent: true, Vibrancy: mygo.VibrancyAcrylic, CornerRadius: 16, BackgroundColor: "#090909", Content: ui.View(a.view)})
 	a.w.OnClose(func(e *mygo.CloseEvent) { e.PreventDefault(); a.hide() })
 	a.w.OnBlur(a.hide)
 	for _, key := range []string{"Alt+Space", "Alt+Shift+Space"} {
@@ -728,7 +789,7 @@ func (a *app) ready() {
 	if a.shortcut == "" {
 		a.status = "Global shortcut unavailable. Use the tray to open Launchr."
 	}
-	tray, err := mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), ToolTip: "Launchr"})
+	tray, err := mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), IconIsTemplate: true, ToolTip: "Launchr"})
 	if err != nil {
 		a.status = "Tray unavailable: " + err.Error()
 	} else {

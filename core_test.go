@@ -182,7 +182,7 @@ func TestLauncherKeyboardAndViews(t *testing.T) {
 		t.Fatalf("search rows=%+v", a.rows)
 	}
 	tt.Key(0, ui.KeyEscape)
-	if a.query != "" || len(a.rows) != 2 {
+	if a.query != "" || len(a.rows) != len(commands)+2 {
 		t.Fatal("Escape did not clear query")
 	}
 	tt.Key(ui.Cmd, ui.Key2)

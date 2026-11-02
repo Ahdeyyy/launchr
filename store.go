@@ -23,8 +23,10 @@ type clip struct {
 	Time                time.Time
 }
 type settings struct {
-	Pins  []string
-	Vault string
+	Pins       []string
+	Vault      string
+	Density    string
+	WindowSize string
 }
 type store struct{ db *bolt.DB }
 

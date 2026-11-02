@@ -1,0 +1,102 @@
+[
+  {
+    "id": 1,
+    "name": "Split vector",
+    "description": "Two unequal chevrons form a forward impulse."
+  },
+  {
+    "id": 2,
+    "name": "Bent ribbon",
+    "description": "One folded ribbon turns a corner toward launch."
+  },
+  {
+    "id": 3,
+    "name": "Notched aperture",
+    "description": "A circular opening breaks into a directional notch."
+  },
+  {
+    "id": 4,
+    "name": "Magnetic gate",
+    "description": "An open gate pulls a single square into its center."
+  },
+  {
+    "id": 5,
+    "name": "Folded cursor",
+    "description": "A cursor plane with a deep negative-space fold."
+  },
+  {
+    "id": 6,
+    "name": "Lifted step",
+    "description": "A staircase becomes a compact rising silhouette."
+  },
+  {
+    "id": 7,
+    "name": "Open capsule",
+    "description": "A soft launch tube with a suspended core."
+  },
+  {
+    "id": 8,
+    "name": "Slingshot",
+    "description": "A taut fork and detached projectile imply release."
+  },
+  {
+    "id": 9,
+    "name": "Quarter orbit",
+    "description": "Two orbital masses with asymmetric weight."
+  },
+  {
+    "id": 10,
+    "name": "Switch rail",
+    "description": "An offset route joins two launch stations."
+  },
+  {
+    "id": 11,
+    "name": "Terminal leaf",
+    "description": "A terminal prompt compressed into a seed."
+  },
+  {
+    "id": 12,
+    "name": "Star slit",
+    "description": "A four-way spark split by a vertical channel."
+  },
+  {
+    "id": 13,
+    "name": "Launch key",
+    "description": "A keycap with an angular release cut."
+  },
+  {
+    "id": 14,
+    "name": "Wedge seam",
+    "description": "A forceful wedge divided by a precise diagonal."
+  },
+  {
+    "id": 15,
+    "name": "Monoline knot",
+    "description": "A single angular loop with an open return."
+  },
+  {
+    "id": 16,
+    "name": "Bracket pulse",
+    "description": "A bracket catches an incoming signal."
+  },
+  {
+    "id": 17,
+    "name": "Displaced square",
+    "description": "One square slides free from a precise corner."
+  },
+  {
+    "id": 18,
+    "name": "Cut portal",
+    "description": "A doorway is split by a rising diagonal."
+  },
+  {
+    "id": 19,
+    "name": "Radial wing",
+    "description": "Three swept vanes suggest a fast controlled turn."
+  },
+  {
+    "id": 20,
+    "name": "L relay",
+    "description": "An L-shaped frame hands off to a lifted dash."
+  }
+]
