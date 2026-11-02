@@ -1,0 +1,6 @@
+{
+  "name": "launchr",
+  "identifier": "app.launchr.desktop",
+  "version": "0.1.0",
+  "out": "build"
+}
