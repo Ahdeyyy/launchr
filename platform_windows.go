@@ -190,3 +190,51 @@ func watchClipboard(notify func()) (func(), error) {
 	var once sync.Once
 	return func() { once.Do(func() { winCall("PostMessageW", r.hwnd, 0x10, 0, 0); <-done }) }, nil
 }
+
+var shellExecuteProc = syscall.NewLazyDLL("shell32.dll").NewProc("ShellExecuteExW")
+
+// shellExecuteInfo is SHELLEXECUTEINFOW; Go's alignment matches its layout.
+type shellExecuteInfo struct {
+	size                    uint32
+	mask                    uint32
+	hwnd                    uintptr
+	verb, file, params, dir *uint16
+	show                    int32
+	instApp, idList         uintptr
+	class                   *uint16
+	classKey                uintptr
+	hotKey                  uint32
+	iconOrMonitor, process  uintptr
+}
+
+// launchElevated opens an app with the shell's "runas" verb, as Start's Run
+// as administrator does. It blocks until the UAC prompt is answered.
+func launchElevated(path string) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	// The verb is resolved through the item's shell context menu, which
+	// needs an apartment on this thread.
+	ole := syscall.NewLazyDLL("ole32.dll")
+	if hr, _, _ := ole.NewProc("CoInitializeEx").Call(0, 2|4); int32(hr) >= 0 {
+		defer ole.NewProc("CoUninitialize").Call()
+	}
+	verb, err := syscall.UTF16PtrFromString("runas")
+	if err != nil {
+		return err
+	}
+	file, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	// SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI: errors
+	// come back here instead of in a shell dialog.
+	info := shellExecuteInfo{mask: 0xc | 0x100 | 0x400, verb: verb, file: file, show: 1}
+	info.size = uint32(unsafe.Sizeof(info))
+	if r, _, callErr := shellExecuteProc.Call(uintptr(unsafe.Pointer(&info))); r == 0 {
+		if callErr == syscall.Errno(1223) { // ERROR_CANCELLED
+			return errElevationCancelled
+		}
+		return callErr
+	}
+	return nil
+}

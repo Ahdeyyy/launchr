@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -32,6 +33,8 @@ func TestRenderCommandScreens(t *testing.T) {
 		}
 		tt := ui.NewTester(a.view, 640, 420)
 		tt.Frame()
+		// Let entrance motion settle before capturing.
+		tt.Advance(time.Second)
 		if screen == "capture" {
 			if rect, ok := tt.Find("Append to daily note"); !ok || rect.Y+rect.H > 420 {
 				t.Fatalf("capture actions clipped: %+v", rect)

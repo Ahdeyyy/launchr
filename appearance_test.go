@@ -16,7 +16,7 @@ func TestSelectionHasNoOverlappingHighlight(t *testing.T) {
 	if tt.HasText("YOUR NEXT MOVE") {
 		t.Fatal("tagline returned")
 	}
-	if !tt.HasText("Running") || !tt.HasText("Switch  ↵") {
+	if !tt.HasText("Running") || !tt.HasText("Switch") {
 		t.Fatal("running window needs a distinct state and action")
 	}
 	rect, ok := tt.Find("Window One")
@@ -36,7 +36,7 @@ func TestSelectionHasNoOverlappingHighlight(t *testing.T) {
 	}
 	tt.Key(0, ui.KeyDown)
 	tt.Frame()
-	if !tt.HasText("Launch  ↵") {
+	if !tt.HasText("Launch") {
 		t.Fatal("installed app needs a Launch action")
 	}
 }
@@ -88,7 +88,7 @@ func TestResultsLeaveScrollbarGutter(t *testing.T) {
 	}
 	tt := ui.NewTester(a.view, 640, 420)
 	for i := 0; i < 3; i++ {
-		r, ok := tt.Find("Switch  ↵")
+		r, ok := tt.Find("Running")
 		if !ok || r.X+r.W > 640-24 {
 			t.Fatalf("result touches scrollbar gutter: %+v", r)
 		}

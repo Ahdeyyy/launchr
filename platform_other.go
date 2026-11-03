@@ -32,3 +32,6 @@ func activateWindow(w appWindow) error {
 func watchClipboard(notify func()) (func(), error) {
 	return nil, fmt.Errorf("clipboard capture currently supports Windows")
 }
+func launchElevated(path string) error {
+	return fmt.Errorf("running as administrator currently supports Windows")
+}

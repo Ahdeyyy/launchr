@@ -94,7 +94,7 @@ func TestDensityLayoutAndNavigation(t *testing.T) {
 			if a.chosen != 39 {
 				t.Fatal("could not reach last result")
 			}
-			r, ok := tt.Find("Switch  ↵")
+			r, ok := tt.Find("Result 39")
 			if !ok || r.Y < 0 || r.Y+r.H > 385 || r.X+r.W > 640-24 {
 				t.Fatalf("selected result clipped or touching scrollbar: %+v", r)
 			}

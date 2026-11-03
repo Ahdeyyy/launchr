@@ -241,7 +241,7 @@ func TestRender(t *testing.T) {
 			if !ok || rect.Y+rect.H > 450 {
 				t.Fatalf("results are clipped: %+v", rect)
 			}
-			rect, ok = tt.Find("Launchr — Visual Studio Code")
+			rect, ok = tt.Find("Visual Studio Code")
 			if !ok || rect.Y > 200 {
 				t.Fatalf("results begin too far down: %+v", rect)
 			}

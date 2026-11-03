@@ -1,15 +1,22 @@
 package main
 
-import "github.com/egoist/mygo/ui"
+import (
+	"time"
 
-func settingsCard(c *ui.Context, icon, title, detail string, body func()) {
+	"github.com/egoist/mygo/ui"
+)
+
+// settingsCard groups related preferences. Cards rise in one after another
+// when Settings opens: an occasional screen, so a short stagger is welcome.
+func settingsCard(c *ui.Context, index int, icon, title, detail string, body func()) {
 	t := c.Theme()
-	ui.Column(c).FillWidth().Padding(4*t.Spacing).Gap(3*t.Spacing).Radius(12).Background(t.Surface).Border(1, t.Border.Alpha(.65)).Children(func() {
+	card := ui.Column(c.Key(title)).FillWidth().Padding(4*t.Spacing).Gap(3*t.Spacing).Radius(12).Background(t.Surface).Border(1, inkLine)
+	appear(card, time.Duration(index)*40*time.Millisecond).Children(func() {
 		ui.Row(c).Gap(3 * t.Spacing).AlignItems(ui.Center).Children(func() {
 			ink := pluginColor(icon)
-			ui.Row(c).Size(32, 32).Center().Radius(9).Background(ink.Alpha(.18)).Shrink(0).Children(func() { ui.Icon(c, rowIcons[icon]).Size(18, 18).TextColor(ink) })
-			ui.Column(c).Grow(1).Gap(t.Spacing).Children(func() {
-				ui.Text(c, title).Bold()
+			ui.Row(c).Size(32, 32).Center().Radius(8).Background(ink.Alpha(.18)).Shrink(0).Children(func() { ui.Icon(c, rowIcons[icon]).Size(18, 18).TextColor(ink) })
+			ui.Column(c).Grow(1).MinWidth(0).Gap(t.Spacing).Children(func() {
+				ui.Text(c, title).FontWeight(500)
 				ui.Text(c, detail).FontSize(12).TextColor(t.TextMuted).Wrap()
 			})
 		})
@@ -24,21 +31,22 @@ func (a *app) settingsView(c *ui.Context) {
 	density := a.density()
 	c.OnShortcut(ui.Cmd, ui.KeyEnter, a.saveSettings)
 	ui.Column(c).Grow(1).FillWidth().MinHeight(0).Children(func() {
-		ui.Row(c).Padding(density.scale(12), density.scale(20), density.scale(16), density.scale(20)).Gap(density.scale(14)).AlignItems(ui.Center).Children(func() {
-			plainButton(c, "Back").Padding(6, 10).Radius(8).Background(t.Surface).TextColor(t.Accent).OnClick(a.back)
-			ui.Column(c).Gap(4).Children(func() {
-				ui.Text(c, "Settings").FontSize(22).Bold()
-				ui.Text(c, "Preferences and integrations").FontSize(12).TextColor(t.TextMuted)
+		ui.Row(c).Padding(density.searchY, density.inset).Gap(density.scale(12)).AlignItems(ui.Center).Shrink(0).Children(func() {
+			backButton(c).OnClick(a.back)
+			ui.Column(c).Gap(2).Grow(1).MinWidth(0).DragWindow().Children(func() {
+				ui.Text(c, "Settings").FontSize(16).FontWeight(500).SingleLine()
+				ui.Text(c, "Preferences and integrations").FontSize(12).TextColor(t.TextMuted).SingleLine()
 			})
 		})
+		ui.Row(c).Height(1).FillWidth().Background(inkLine).Shrink(0)
 		ui.Scroll(c.Key("settings-scroll")).Grow(1).FillWidth().MinHeight(0).Children(func() {
-			ui.Column(c).FillWidth().Padding(0, density.scale(20)+8, density.scale(16), density.scale(20)).Gap(density.gap).Children(func() {
-				settingsCard(c, "note", "Obsidian", "Choose where notes and quick captures are saved.", func() {
+			ui.Column(c).FillWidth().Padding(density.scale(16), density.scale(20)+8, density.scale(16), density.scale(20)).Gap(density.gap).Children(func() {
+				settingsCard(c, 0, "note", "Obsidian", "Choose where notes and quick captures are saved.", func() {
 					ui.Text(c, "Vault name").FontSize(12).TextColor(t.TextMuted)
 					ui.TextInput(c.Key("vault"), &a.vaultEdit).Bind(&a.formInput).Label("Obsidian vault").Placeholder("Active vault (default)").FillWidth()
 					ui.Text(c, "Leave empty to use the active vault. Enable the CLI in Obsidian → Settings → General.").FontSize(12).TextColor(t.TextMuted).Wrap()
 				})
-				settingsCard(c, "settings", "Launcher density", "Choose how compact or spacious the launcher feels.", func() {
+				settingsCard(c, 1, "settings", "Launcher density", "Choose how compact or spacious the launcher feels.", func() {
 					ui.RadioGroup(c.Key("density"), func() {
 						ui.Row(c).Gap(density.scale(16)).Children(func() {
 							ui.Radio(c.Key("compact"), &a.densityEdit, "compact", "Compact")
@@ -48,7 +56,7 @@ func (a *app) settingsView(c *ui.Context) {
 					})
 					ui.Text(c, "Preview spacing instantly. Save to keep this density across the app.").FontSize(12).TextColor(t.TextMuted).Wrap()
 				})
-				settingsCard(c, "window", "Window size", "Choose how much screen space the launcher uses.", func() {
+				settingsCard(c, 2, "window", "Window size", "Choose how much screen space the launcher uses.", func() {
 					ui.RadioGroup(c.Key("window-size"), func() {
 						ui.Row(c).Gap(density.scale(16)).Children(func() {
 							ui.Radio(c.Key("small"), &a.windowSizeEdit, "small", "Small")
@@ -58,27 +66,29 @@ func (a *app) settingsView(c *ui.Context) {
 					})
 					ui.Text(c, "Small: 640 × 420 · Medium: 760 × 520 · Large: 960 × 680. Applies when you save; fits your screen.").FontSize(12).TextColor(t.TextMuted).Wrap()
 				})
-				settingsCard(c, "clip", "Clipboard", "History is stored on this device until you delete it.", func() {
+				settingsCard(c, 3, "clip", "Clipboard", "History is stored on this device until you delete it.", func() {
 					ui.Text(c, "Storage is unencrypted. Pause capture in Clipboard History whenever you need to.").FontSize(12).TextColor(t.TextMuted).Wrap()
 				})
-				settingsCard(c, "settings", "Keyboard", "Navigate without leaving the keyboard.", func() {
-					for _, shortcut := range [][2]string{{"Open launcher", a.shortcut}, {"Switch views", "Ctrl+1–4"}, {"Focus search", "Ctrl+F"}, {"Pin application", "Ctrl+P"}, {"Create note", "Ctrl+Enter"}, {"Append to daily note", "Ctrl+Shift+Enter"}} {
+				settingsCard(c, 4, "settings", "Keyboard", "Navigate without leaving the keyboard.", func() {
+					for _, shortcut := range [][2]string{{"Open launcher", a.shortcut}, {"Switch views", "Ctrl+1–4"}, {"Focus search", "Ctrl+F"}, {"Pin application", "Ctrl+P"}, {"Run as administrator", "Ctrl+Shift+Enter"}, {"Create note", "Ctrl+Enter"}, {"Append to daily note", "Ctrl+Shift+Enter"}} {
 						keys := shortcut[1]
 						if keys == "" {
 							keys = "Alt+Space"
 						}
-						ui.Row(c).Gap(16).Children(func() {
-							ui.Text(c, shortcut[0]).FontSize(12).Grow(1)
-							ui.Text(c, keys).FontSize(12).TextColor(t.TextMuted)
+						ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, shortcut[0]).FontSize(12).Grow(1).MinWidth(0)
+							keycap(c, keys)
 						})
 					}
 				})
 			})
 		})
-		ui.Row(c).Padding(density.scale(12), density.scale(20)).Gap(density.gap).AlignItems(ui.Center).Background(t.Surface).Children(func() {
-			ui.Text(c, "Esc Back").FontSize(12).TextColor(t.TextMuted).Grow(1)
-			ui.Text(c, "Ctrl+Enter").FontSize(12).TextColor(t.TextMuted)
-			ui.PrimaryButton(c, "Save").OnClick(a.saveSettings)
+		ui.Row(c).Padding(7, density.inset-4, 7, density.inset).Gap(6).AlignItems(ui.Center).Background(t.Surface).BorderWidth(1, 0, 0, 0).BorderColor(inkLine).Shrink(0).Children(func() {
+			ui.Icon(c, appMark).Size(16, 16).TextColor(inkMuted).Shrink(0)
+			ui.Text(c, "Launchr / Settings").FontSize(12).TextColor(inkMuted).Grow(1).MinWidth(0).SingleLine()
+			actionButton(c, "Discard", "Esc").OnClick(a.back)
+			ui.Row(c).Size(1, 14).Background(inkLine).Shrink(0)
+			actionButton(c, "Save", "Ctrl", "Enter").OnClick(a.saveSettings)
 		})
 	})
 }

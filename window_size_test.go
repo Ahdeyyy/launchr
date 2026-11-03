@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -86,6 +87,7 @@ func TestWindowSizeSettingsLayout(t *testing.T) {
 				tt.Key(0, ui.KeyTab)
 				tt.Key(0, ui.KeyTab)
 				tt.Frame()
+				tt.Advance(time.Second)
 				for _, label := range []string{"Small", "Medium", "Large", "Save"} {
 					r, ok := tt.Find(label)
 					if !ok || r.X < 0 || r.Y < 0 || r.X+r.W > float32(w) || r.Y+r.H > float32(h) {
