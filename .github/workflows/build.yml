@@ -1,0 +1,104 @@
+# Builds and tests Launchr on every pull request and push to main. Pull
+# requests upload the app as a workflow artifact; pushes to main also publish
+# it as a GitHub Release tagged v<mygo.json version>-build.<run number>.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Superseded pull request builds are cancelled; main builds all finish so
+  # every commit gets its release.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build for Windows
+    runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      CGO_ENABLED: "0"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go tool mygo vet .
+
+      - name: Read version
+        id: version
+        run: |
+          $version = (Get-Content mygo.json -Raw | ConvertFrom-Json).version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version-build.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      # Produces dist/windows-amd64: the portable app, with the NSIS installer
+      # launchr-setup-<version>-amd64.exe beside it. mygo downloads NSIS when
+      # the runner lacks it.
+      - name: Build
+        run: go tool mygo build -platform windows/amd64 -o dist .
+
+      - name: Package
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force release | Out-Null
+          # mygo only warns when it cannot make the installer; a release
+          # without one is a failed build.
+          $installer = Get-ChildItem dist/windows-amd64 -Filter 'launchr-setup-*.exe' | Select-Object -First 1
+          if (-not $installer) { throw "mygo build did not produce the installer" }
+          Move-Item $installer.FullName release/
+          Compress-Archive -Path dist/windows-amd64/* -DestinationPath "release/launchr-$version-windows-amd64.zip"
+          Get-ChildItem release -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii release/SHA256SUMS.txt
+          Get-ChildItem release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: launchr-${{ steps.version.outputs.tag }}-windows-amd64
+          path: release/
+          if-no-files-found: error
+
+  # Publishing runs apart from the build so that pull request code never runs
+  # with a token that can write releases.
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: launchr-${{ needs.build.outputs.tag }}-windows-amd64
+          path: release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          gh release create "$TAG" release/* \
+            --target "$GITHUB_SHA" \
+            --title "Launchr $TAG" \
+            --generate-notes
