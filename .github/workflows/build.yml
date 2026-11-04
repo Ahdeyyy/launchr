@@ -1,13 +1,13 @@
-# Builds and tests Launchr on every pull request and push to main. Pull
-# requests upload the app as a workflow artifact; pushes to main also publish
+# Builds and tests Launchr on every pull request and push to master. Pull
+# requests upload the app as a workflow artifact; pushes to master also publish
 # it as a GitHub Release tagged v<mygo.json version>-build.<run number>.
 name: Build and release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Superseded pull request builds are cancelled; main builds all finish so
+  # Superseded pull request builds are cancelled; master builds all finish so
   # every commit gets its release.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -82,7 +82,7 @@ jobs:
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
